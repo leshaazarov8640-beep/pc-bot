@@ -255,9 +255,12 @@ def run_bot():
 
 
 # ������ ���� � ��������� ������ ��� ������� ������ (��� gunicorn)
-bot_thread = threading.Thread(target=run_bot, daemon=True)
-bot_thread.start()
-
-if __name__ == "__main__":
+def run_flask():
     logger.info("Flask API starting on port %s...", PORT)
     app.run(host="0.0.0.0", port=PORT, debug=False)
+
+flask_thread = threading.Thread(target=run_flask, daemon=True)
+flask_thread.start()
+
+if __name__ == "__main__":
+    run_bot()
