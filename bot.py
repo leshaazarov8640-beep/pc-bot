@@ -4,6 +4,7 @@ import logging
 import socket
 import struct
 import threading
+import asyncio
 import time
 from datetime import datetime
 
@@ -253,7 +254,7 @@ def run_bot():
         logger.error("Bot error: %s", e)
 
 
-# Запуск бота в отдельном потоке при импорте модуля (для gunicorn)
+# пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅ пїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅпїЅ пїЅпїЅпїЅпїЅпїЅпїЅ (пїЅпїЅпїЅ gunicorn)
 bot_thread = threading.Thread(target=run_bot, daemon=True)
 bot_thread.start()
 
