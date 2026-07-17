@@ -2,46 +2,32 @@ import os
 import json
 import logging
 import socket
-import struct
-import threading
-import asyncio
 import time
+import threading
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
-from flask import Flask, request, jsonify
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+import requests
 
 logging.basicConfig(format="%(asctime)s %(levelname)s: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 TOKEN = os.environ.get("BOT_TOKEN", "")
-ALLOWED_IDS = os.environ.get("ALLOWED_IDS", "")
 ALLOW_EVERYONE = os.environ.get("ALLOW_EVERYONE", "true").lower() == "true"
 
 PC_MAC = os.environ.get("PC_MAC", "B4:2E:99:ED:26:3F")
 PC_BROADCAST = os.environ.get("PC_BROADCAST", "255.255.255.255")
-PC_PORT = int(os.environ.get("PC_WOL_PORT", "9"))
-PC_IP = os.environ.get("PC_IP", "")
+PC_WOL_PORT = int(os.environ.get("PC_WOL_PORT", "9"))
 
 PORT = int(os.environ.get("PORT", 8080))
-
-allowed_users = [int(x.strip()) for x in ALLOWED_IDS.split(",") if x.strip()]
-
+TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
+last_update_id = 0
 pending_commands = {}
-agent_last_seen = {}
-agent_ip = PC_IP
-
-app = Flask(__name__)
+agent_last_seen = 0
+agent_ip = ""
 
 
-def is_authorized(user_id: int) -> bool:
-    if ALLOW_EVERYONE:
-        return True
-    return user_id in allowed_users
-
-
-def send_wol(mac: str, broadcast: str, port: int) -> bool:
+def send_wol(mac: str) -> bool:
     try:
         mac_clean = mac.replace(":", "").replace("-", "")
         if len(mac_clean) != 12:
@@ -50,185 +36,155 @@ def send_wol(mac: str, broadcast: str, port: int) -> bool:
         magic = b"\xff" * 6 + mac_bytes * 16
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            sock.sendto(magic, (broadcast, port))
+            sock.sendto(magic, (PC_BROADCAST, PC_WOL_PORT))
         return True
     except Exception as e:
         logger.error("WOL error: %s", e)
         return False
 
 
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
-        await update.message.reply_text("Нет доступа.")
-        return
-    await update.message.reply_text(
-        "Привет! Управление ПК через Telegram.\n\n"
-        "/wake — включить ПК (WOL)\n"
-        "/off — выключить ПК\n"
-        "/reboot — перезагрузить\n"
-        "/sleep — сон\n"
-        "/lock — заблокировать\n"
-        "/status — статус ПК\n"
-        "/cancel — отменить выключение\n"
-        "/help — помощь"
-    )
+def tg_send(chat_id: int, text: str):
+    try:
+        requests.post(f"{TELEGRAM_API}/sendMessage", json={
+            "chat_id": chat_id, "text": text, "parse_mode": "HTML"
+        }, timeout=5)
+    except Exception as e:
+        logger.error("TG send error: %s", e)
 
 
-async def cmd_wake(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
-        return
-    if send_wol(PC_MAC, PC_BROADCAST, PC_PORT):
-        await update.message.reply_text(f"✅ WOL-пакет отправлен на {PC_MAC}")
+def handle_command(chat_id: int, text: str):
+    global agent_last_seen, agent_ip
+
+    parts = text.strip().split()
+    cmd = parts[0].lower()
+
+    if cmd == "/start" or cmd == "/help":
+        tg_send(chat_id, (
+            "Управление ПК через Telegram\n\n"
+            "/wake — включить ПК (WOL)\n"
+            "/off [сек] — выключить\n"
+            "/reboot — перезагрузить\n"
+            "/sleep — сон\n"
+            "/lock — заблокировать\n"
+            "/cancel — отменить выключение\n"
+            "/status — статус ПК"
+        ))
+    elif cmd == "/wake":
+        if send_wol(PC_MAC):
+            tg_send(chat_id, f"✅ WOL-пакет отправлен на {PC_MAC}")
+        else:
+            tg_send(chat_id, "❌ Ошибка WOL")
+    elif cmd == "/off":
+        delay = 30
+        if len(parts) > 1:
+            try:
+                delay = int(parts[1])
+            except ValueError:
+                pass
+        pending_commands["shutdown"] = {"delay": delay}
+        tg_send(chat_id, f"⏳ Выключение через {delay} сек.")
+    elif cmd == "/reboot":
+        pending_commands["reboot"] = {}
+        tg_send(chat_id, "⏳ Перезагрузка...")
+    elif cmd == "/sleep":
+        pending_commands["sleep"] = {}
+        tg_send(chat_id, "⏳ Сон...")
+    elif cmd == "/lock":
+        pending_commands["lock"] = {}
+        tg_send(chat_id, "🔒 Блокировка...")
+    elif cmd == "/cancel":
+        pending_commands["cancel_shutdown"] = {}
+        tg_send(chat_id, "❌ Выключение отменено.")
+    elif cmd == "/status":
+        now = time.time()
+        if now - agent_last_seen < 30:
+            tg_send(chat_id, f"✅ ПК ВКЛЮЧЁН\nIP: {agent_ip}")
+        else:
+            tg_send(chat_id, "❌ ПК ВЫКЛЮЧЕН\n/wake чтобы включить.")
     else:
-        await update.message.reply_text("❌ Ошибка отправки WOL. Проверьте MAC-адрес.")
+        tg_send(chat_id, "Неизвестная команда. /help")
 
 
-async def cmd_off(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
-        return
-    delay = 30
-    if context.args:
+def poll_bot():
+    global last_update_id
+    while True:
         try:
-            delay = int(context.args[0])
-        except ValueError:
+            url = f"{TELEGRAM_API}/getUpdates?timeout=30"
+            if last_update_id:
+                url += f"&offset={last_update_id + 1}"
+            r = requests.get(url, timeout=35)
+            data = r.json()
+            if not data.get("ok"):
+                continue
+            for upd in data.get("result", []):
+                last_update_id = upd["update_id"]
+                msg = upd.get("message")
+                if not msg:
+                    continue
+                chat_id = msg["chat"]["id"]
+                text = msg.get("text", "")
+                handle_command(chat_id, text)
+        except requests.Timeout:
             pass
-    pending_commands["shutdown"] = {"delay": delay, "user": update.effective_user.id}
-    await update.message.reply_text(f"⏳ Команда выключения отправлена (через {delay} сек).")
+        except Exception as e:
+            logger.error("Poll error: %s", e)
+            time.sleep(3)
 
 
-async def cmd_reboot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
-        return
-    pending_commands["reboot"] = {"user": update.effective_user.id}
-    await update.message.reply_text("⏳ Команда перезагрузки отправлена.")
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_json({"status": "ok"})
+        elif self.path.startswith("/api/command"):
+            self.send_json(pending_commands if pending_commands else {"command": "none"})
+        elif self.path == "/":
+            self.send_json({
+                "status": "ok",
+                "pc": "online" if (time.time() - agent_last_seen < 30) else "offline",
+            })
+        else:
+            self.send_error(404)
 
+    def do_POST(self):
+        global agent_last_seen, agent_ip
+        length = int(self.headers.get("Content-Length", 0))
+        body = self.rfile.read(length) if length else b"{}"
+        try:
+            data = json.loads(body)
+        except json.JSONDecodeError:
+            data = {}
 
-async def cmd_sleep(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
-        return
-    pending_commands["sleep"] = {"user": update.effective_user.id}
-    await update.message.reply_text("⏳ Команда сна отправлена.")
+        if self.path == "/api/ping":
+            agent_last_seen = time.time()
+            agent_ip = data.get("ip", self.client_address[0])
+            self.send_json({"ok": True})
+        elif self.path == "/api/command/done":
+            cmd = data.get("command", "")
+            if cmd in pending_commands:
+                del pending_commands[cmd]
+            self.send_json({"ok": True})
+        elif self.path == "/api/wake":
+            ok = send_wol(PC_MAC)
+            self.send_json({"wol_sent": ok})
+        else:
+            self.send_error(404)
 
+    def send_json(self, obj):
+        msg = json.dumps(obj).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(msg)))
+        self.end_headers()
+        self.wfile.write(msg)
 
-async def cmd_lock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
-        return
-    pending_commands["lock"] = {"user": update.effective_user.id}
-    await update.message.reply_text("⏳ Команда блокировки отправлена.")
-
-
-async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
-        return
-    pending_commands["cancel_shutdown"] = {"user": update.effective_user.id}
-    await update.message.reply_text("⏳ Команда отмены выключения отправлена.")
-
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
-        return
-    now = datetime.now()
-    last_seen = agent_last_seen.get("agent", 0)
-    diff = now.timestamp() - last_seen
-    if diff < 30:
-        ip = agent_ip or PC_IP or "неизвестен"
-        await update.message.reply_text(f"✅ ПК ВКЛЮЧЁН\nIP: {ip}\nСигнал: {diff:.0f} сек назад")
-    else:
-        await update.message.reply_text("❌ ПК ВЫКЛЮЧЕН.\nИспользуйте /wake для включения.")
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_authorized(update.effective_user.id):
-        return
-    online = (datetime.now().timestamp() - agent_last_seen.get("agent", 0)) < 30
-    text = (
-        "📖 Команды:\n"
-        "/wake — включить ПК (WOL)\n"
-        "/off [сек] — выключить ПК\n"
-        "/reboot — перезагрузить\n"
-        "/sleep — сон\n"
-        "/lock — заблокировать\n"
-        "/cancel — отменить выключение\n"
-        "/status — статус ПК\n\n"
-        f"MAC: {PC_MAC}\n"
-        f"Статус: {'✅ онлайн' if online else '❌ офлайн'}"
-    )
-    await update.message.reply_text(text)
-
-
-@app.route("/api/ping", methods=["POST"])
-def api_ping():
-    data = request.get_json(silent=True) or {}
-    global agent_ip
-    agent_last_seen["agent"] = time.time()
-    if data.get("ip"):
-        agent_ip = data["ip"]
-    if request.remote_addr:
-        agent_ip = request.remote_addr
-    return jsonify({"ok": True})
-
-
-@app.route("/api/command", methods=["GET"])
-def api_get_command():
-    if pending_commands:
-        cmd_name, cmd_data = next(iter(pending_commands.items()))
-        cmd_data["command"] = cmd_name
-        return jsonify(cmd_data)
-    return jsonify({"command": "none"})
-
-
-@app.route("/api/command/done", methods=["POST"])
-def api_command_done():
-    data = request.get_json(silent=True) or {}
-    cmd = data.get("command", "")
-    if cmd in pending_commands:
-        del pending_commands[cmd]
-    logger.info("Command done: %s", cmd)
-    return jsonify({"ok": True})
-
-
-@app.route("/api/wake", methods=["POST"])
-def api_wake():
-    ok = send_wol(PC_MAC, PC_BROADCAST, PC_PORT)
-    return jsonify({"wol_sent": ok, "mac": PC_MAC})
-
-
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok"})
-
-
-@app.route("/")
-def index():
-    online = (time.time() - agent_last_seen.get("agent", 0)) < 30
-    return jsonify({
-        "service": "PC Remote Bot",
-        "pc_status": "online" if online else "offline",
-        "commands_pending": list(pending_commands.keys()),
-    })
-
-
-def run_bot():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-
-    bot_app = Application.builder().token(TOKEN).build()
-    bot_app.add_handler(CommandHandler("start", cmd_start))
-    bot_app.add_handler(CommandHandler("wake", cmd_wake))
-    bot_app.add_handler(CommandHandler("off", cmd_off))
-    bot_app.add_handler(CommandHandler("reboot", cmd_reboot))
-    bot_app.add_handler(CommandHandler("sleep", cmd_sleep))
-    bot_app.add_handler(CommandHandler("lock", cmd_lock))
-    bot_app.add_handler(CommandHandler("cancel", cmd_cancel))
-    bot_app.add_handler(CommandHandler("status", cmd_status))
-    bot_app.add_handler(CommandHandler("help", cmd_help))
-
-    logger.info("Starting polling...")
-    bot_app.run_polling()
+    def log_message(self, format, *args):
+        logger.info("%s - %s", self.client_address[0], format % args)
 
 
 if __name__ == "__main__":
-    t = threading.Thread(target=run_bot, daemon=True)
+    t = threading.Thread(target=poll_bot, daemon=True)
     t.start()
-    logger.info("Starting Flask on port %s...", PORT)
-    app.run(host="0.0.0.0", port=PORT, debug=False)
+    logger.info("Bot polling started in thread")
+    logger.info("Starting HTTP server on port %s...", PORT)
+    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server.serve_forever()
