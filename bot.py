@@ -253,9 +253,10 @@ def run_bot():
         logger.error("Bot error: %s", e)
 
 
-if __name__ == "__main__":
-    bot_thread = threading.Thread(target=run_bot, daemon=True)
-    bot_thread.start()
+# Запуск бота в отдельном потоке при импорте модуля (для gunicorn)
+bot_thread = threading.Thread(target=run_bot, daemon=True)
+bot_thread.start()
 
+if __name__ == "__main__":
     logger.info("Flask API starting on port %s...", PORT)
     app.run(host="0.0.0.0", port=PORT, debug=False)
