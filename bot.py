@@ -12,7 +12,7 @@ logger = logging.getLogger(__name__)
 
 app = flask.Flask(__name__)
 
-TOKEN = os.environ.get("BOT_TOKEN", "8992588757:AAFBUQQGUfq04cEE_wEI-9cvHGVfYiZE3PA")
+TOKEN = os.environ.get("BOT_TOKEN", "")
 PC_MAC = os.environ.get("PC_MAC", "B4:2E:99:ED:26:3F")
 ALLOW_EVERYONE = os.environ.get("ALLOW_EVERYONE", "true").lower() == "true"
 
@@ -67,10 +67,7 @@ def handle_command(chat_id: int, text: str):
             "/status — статус ПК"
         ))
     elif cmd == "/wake":
-        if send_wol(PC_MAC):
-            tg_send(chat_id, f"✅ WOL-пакет отправлен на {PC_MAC}")
-        else:
-            tg_send(chat_id, "❌ Ошибка WOL")
+        tg_send(chat_id, f"Открой Mocha WOL на iPhone и отправь пакет на MAC: {PC_MAC}\nИли нажми кнопку в приложении.")
     elif cmd == "/off":
         delay = 30
         if len(parts) > 1:
