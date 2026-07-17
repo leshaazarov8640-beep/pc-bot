@@ -3,28 +3,24 @@ import json
 import logging
 import socket
 import time
-import threading
 from datetime import datetime
-from http.server import HTTPServer, BaseHTTPRequestHandler
 
-import requests
+import flask
 
 logging.basicConfig(format="%(asctime)s %(levelname)s: %(message)s", level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-TOKEN = os.environ.get("BOT_TOKEN", "")
+app = flask.Flask(__name__)
+
+TOKEN = os.environ.get("BOT_TOKEN", "8992588757:AAFBUQQGUfq04cEE_wEI-9cvHGVfYiZE3PA")
+PC_MAC = os.environ.get("PC_MAC", "B4:2E:99:ED:26:3F")
 ALLOW_EVERYONE = os.environ.get("ALLOW_EVERYONE", "true").lower() == "true"
 
-PC_MAC = os.environ.get("PC_MAC", "B4:2E:99:ED:26:3F")
-PC_BROADCAST = os.environ.get("PC_BROADCAST", "255.255.255.255")
-PC_WOL_PORT = int(os.environ.get("PC_WOL_PORT", "9"))
-
-PORT = int(os.environ.get("PORT", 8080))
-TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
-last_update_id = 0
 pending_commands = {}
 agent_last_seen = 0
 agent_ip = ""
+
+TELEGRAM_API = f"https://api.telegram.org/bot{TOKEN}"
 
 
 def send_wol(mac: str) -> bool:
@@ -36,7 +32,7 @@ def send_wol(mac: str) -> bool:
         magic = b"\xff" * 6 + mac_bytes * 16
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-            sock.sendto(magic, (PC_BROADCAST, PC_WOL_PORT))
+            sock.sendto(magic, ("255.255.255.255", 9))
         return True
     except Exception as e:
         logger.error("WOL error: %s", e)
@@ -45,16 +41,17 @@ def send_wol(mac: str) -> bool:
 
 def tg_send(chat_id: int, text: str):
     try:
+        import requests
         requests.post(f"{TELEGRAM_API}/sendMessage", json={
             "chat_id": chat_id, "text": text, "parse_mode": "HTML"
-        }, timeout=5)
+        }, timeout=10)
+    except ImportError:
+        logger.error("requests not installed")
     except Exception as e:
         logger.error("TG send error: %s", e)
 
 
 def handle_command(chat_id: int, text: str):
-    global agent_last_seen, agent_ip
-
     parts = text.strip().split()
     cmd = parts[0].lower()
 
@@ -105,86 +102,55 @@ def handle_command(chat_id: int, text: str):
         tg_send(chat_id, "Неизвестная команда. /help")
 
 
-def poll_bot():
-    global last_update_id
-    while True:
-        try:
-            url = f"{TELEGRAM_API}/getUpdates?timeout=30"
-            if last_update_id:
-                url += f"&offset={last_update_id + 1}"
-            r = requests.get(url, timeout=35)
-            data = r.json()
-            if not data.get("ok"):
-                continue
-            for upd in data.get("result", []):
-                last_update_id = upd["update_id"]
-                msg = upd.get("message")
-                if not msg:
-                    continue
-                chat_id = msg["chat"]["id"]
-                text = msg.get("text", "")
-                handle_command(chat_id, text)
-        except requests.Timeout:
-            pass
-        except Exception as e:
-            logger.error("Poll error: %s", e)
-            time.sleep(3)
+@app.route(f"/{TOKEN}", methods=["POST"])
+def webhook():
+    data = flask.request.get_json(silent=True)
+    if not data:
+        return "ok", 200
+    msg = data.get("message", {})
+    chat_id = msg.get("chat", {}).get("id")
+    text = msg.get("text", "")
+    if chat_id:
+        handle_command(chat_id, text)
+    return "ok", 200
 
 
-class Handler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == "/health":
-            self.send_json({"status": "ok"})
-        elif self.path.startswith("/api/command"):
-            self.send_json(pending_commands if pending_commands else {"command": "none"})
-        elif self.path == "/":
-            self.send_json({
-                "status": "ok",
-                "pc": "online" if (time.time() - agent_last_seen < 30) else "offline",
-            })
-        else:
-            self.send_error(404)
-
-    def do_POST(self):
-        global agent_last_seen, agent_ip
-        length = int(self.headers.get("Content-Length", 0))
-        body = self.rfile.read(length) if length else b"{}"
-        try:
-            data = json.loads(body)
-        except json.JSONDecodeError:
-            data = {}
-
-        if self.path == "/api/ping":
-            agent_last_seen = time.time()
-            agent_ip = data.get("ip", self.client_address[0])
-            self.send_json({"ok": True})
-        elif self.path == "/api/command/done":
-            cmd = data.get("command", "")
-            if cmd in pending_commands:
-                del pending_commands[cmd]
-            self.send_json({"ok": True})
-        elif self.path == "/api/wake":
-            ok = send_wol(PC_MAC)
-            self.send_json({"wol_sent": ok})
-        else:
-            self.send_error(404)
-
-    def send_json(self, obj):
-        msg = json.dumps(obj).encode()
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(msg)))
-        self.end_headers()
-        self.wfile.write(msg)
-
-    def log_message(self, format, *args):
-        logger.info("%s - %s", self.client_address[0], format % args)
+@app.route("/api/ping", methods=["POST"])
+def api_ping():
+    global agent_ip, agent_last_seen
+    data = flask.request.get_json(silent=True) or {}
+    agent_last_seen = time.time()
+    agent_ip = data.get("ip", flask.request.remote_addr or "")
+    return flask.jsonify({"ok": True})
 
 
-if __name__ == "__main__":
-    t = threading.Thread(target=poll_bot, daemon=True)
-    t.start()
-    logger.info("Bot polling started in thread")
-    logger.info("Starting HTTP server on port %s...", PORT)
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
-    server.serve_forever()
+@app.route("/api/command", methods=["GET"])
+def api_get_command():
+    if pending_commands:
+        cmd_name, cmd_data = next(iter(pending_commands.items()))
+        cmd_data["command"] = cmd_name
+        return flask.jsonify(cmd_data)
+    return flask.jsonify({"command": "none"})
+
+
+@app.route("/api/command/done", methods=["POST"])
+def api_command_done():
+    data = flask.request.get_json(silent=True) or {}
+    cmd = data.get("command", "")
+    if cmd in pending_commands:
+        del pending_commands[cmd]
+    return flask.jsonify({"ok": True})
+
+
+@app.route("/health")
+def health():
+    return flask.jsonify({"status": "ok"})
+
+
+@app.route("/")
+def index():
+    online = (time.time() - agent_last_seen < 30)
+    return flask.jsonify({
+        "service": "PC Remote Bot",
+        "pc_status": "online" if online else "offline",
+    })
